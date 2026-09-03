@@ -1,0 +1,8 @@
+# Зависимости лабораторной работы 1 (LLM-агент с ImageGeneratorTool).
+requests>=2.28.0
+python-decouple>=3.8
+ddgs>=9.0.0
+
+# Тесты и покрытие кода.
+pytest>=7.0.0
+pytest-cov>=4.0.0

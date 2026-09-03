@@ -7,6 +7,7 @@ from decouple import config
 
 from .tool_calculator import CalculatorTool
 from .tool_websearch import WebSearchTool
+from .tool_image_generator import ImageGeneratorTool
 
 class LLMAgent:
     """
@@ -42,6 +43,7 @@ class LLMAgent:
         self.tools = {
             "calculator": CalculatorTool(),
             "web_search": WebSearchTool(),
+            "image_generator": ImageGeneratorTool(),
         }
         self.conversation_history = []
     
@@ -87,6 +89,7 @@ class LLMAgent:
         Available tools:
         - **calculator**: For any math-related questions (numbers, calculations). Use it with the full expression.
         - **web_search**: For finding any information about the real world (current events, facts, definitions). Use it with the user's question or a clear search query. USE ONLY RUSSIAN LANGUAGE QUERIES in this tool.
+        - **image_generator**: For requests to draw, generate or create a picture/image. Use it with a short visual description of what must be drawn. TRANSLATE the description into ENGLISH - the image model does not understand Russian. Optionally add the size at the end after a vertical bar, for example: "watercolor painting of a ginger cat wearing a hat | 512x512".
 
         Your response MUST be ONLY a JSON object of the following format.
         If one or more tools are needed to answer, return JSON of this structure:
@@ -128,8 +131,6 @@ class LLMAgent:
             else:
                 cleaned_json_text = llm_text
 
-            print(f"> Ответ LLM для плана (очищенный): {cleaned_json_text}")
-            
             # Пытаемся преобразовать ответ в JSON
             action_plan = json.loads(cleaned_json_text)
             plan = action_plan.get("plan", [])
@@ -156,6 +157,10 @@ class LLMAgent:
         prompt = f"""
         Based on the following conversation log, provide a direct and helpful answer to the user's original question.
         Be concise and use the information from the tool results to support your answer.
+
+        Answer in Russian. Write the answer itself, with no preamble, no restating of the
+        question and no guesses about what the user meant. If a tool returned a link,
+        state that the result is ready and give the link exactly as it is, unchanged.
 
         Original User Question: {user_query}
 
@@ -204,7 +209,7 @@ class LLMAgent:
                 return "Извините, не удалось сгенерировать ответ."
 
         # --- Шаг 2: Исполнение плана ---
-        print(f"План действий: {plan}")
+        print(f"Запрос: {plan}")
         for step in plan:
             tool_name = step.get('action')
             tool_input = step.get('input')
@@ -225,7 +230,6 @@ class LLMAgent:
                 self.conversation_history.append({'role': 'system', 'content': error_msg})
         
         # --- Шаг 3: Генерация финального ответа ---
-        print("Составляю финальный ответ...")
         final_response = self._generate_final_response(query)
         return final_response
 
