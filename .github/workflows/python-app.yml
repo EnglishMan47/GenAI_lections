@@ -42,5 +42,5 @@ jobs:
       with:
         token: ${{ secrets.CODECOV_TOKEN }}
         files: ./coverage.xml
-        # Недоступность Codecov не должна ронять сборку: тесты уже прошли.
+        # Недоступность Codecov не должна ронять сборку
         fail_ci_if_error: false

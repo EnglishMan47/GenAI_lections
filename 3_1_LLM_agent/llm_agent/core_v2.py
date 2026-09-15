@@ -9,17 +9,23 @@ from .tool_calculator import CalculatorTool
 from .tool_websearch import WebSearchTool
 from .tool_image_generator import ImageGeneratorTool
 
+
 class LLMAgent:
     """
     LLM-агент, который планирует и выполняет задачи с помощью инструментов.
     Поддерживает как OpenRouter API, так и локальный Ollama.
     """
 
-    def __init__(self, model: str = "tngtech/deepseek-r1t2-chimera", local: bool = False, 
-                 ollama_base_url: str = "http://localhost:11434", ollama_model: str = "qwen3:0.6b"):
+    def __init__(
+        self,
+        model: str = "tngtech/deepseek-r1t2-chimera",
+        local: bool = False,
+        ollama_base_url: str = "http://localhost:11434",
+        ollama_model: str = "qwen3:0.6b",
+    ):
         """
         Инициализирует агента.
-        
+
         Args:
             model (str): Название модели для OpenRouter.
             local (bool): Если True, использует локальный Ollama вместо OpenRouter.
@@ -29,16 +35,16 @@ class LLMAgent:
         self.local = local
         self.ollama_base_url = ollama_base_url
         self.ollama_model = ollama_model
-        
+
         if not self.local:
-            self.api_key = config('OPENROUTER_API_KEY')
+            self.api_key = config("OPENROUTER_API_KEY")
             self.url = "https://openrouter.ai/api/v1/chat/completions"
             self.model = model
         else:
             self.api_key = None
             self.url = f"{self.ollama_base_url}/v1/chat/completions"
             self.model = ollama_model
-        
+
         # Создаем экземпляры инструментов
         self.tools = {
             "calculator": CalculatorTool(),
@@ -46,37 +52,41 @@ class LLMAgent:
             "image_generator": ImageGeneratorTool(),
         }
         self.conversation_history = []
-    
+
     def _make_api_request(self, payload: Dict, headers: Optional[Dict] = None) -> Dict:
         """
         Универсальный метод для отправки запросов к API.
         Поддерживает как OpenRouter, так и Ollama.
-        
+
         Args:
             payload (Dict): Тело запроса.
             headers (Dict, optional): Заголовки запроса.
-            
+
         Returns:
             Dict: Ответ от API.
         """
         if headers is None:
             headers = {}
-        
+
         if not self.local:
-            headers.update({
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json"
-            })
+            headers.update(
+                {
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                }
+            )
         else:
             headers["Content-Type"] = "application/json"
-        
+
         try:
-            response = requests.post(self.url, json=payload, headers=headers)
+            response = requests.post(
+                self.url, json=payload, headers=headers, timeout=(10, 120)
+            )
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
             raise Exception(f"Ошибка при запросе к API: {e}")
-    
+
     def _ask_llm_for_plan(self, query: str) -> List[Dict]:
         """
         Создает план действий, используя LLM.
@@ -107,25 +117,28 @@ class LLMAgent:
             "model": self.model,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": query}
-            ]
+                {"role": "user", "content": query},
+            ],
         }
-        
+
         try:
             # Для Ollama может потребоваться дополнительная настройка
             if self.local:
                 # Некоторые модели Ollama могут требовать параметр stream=False
                 payload["stream"] = False
-            
+
             response_data = self._make_api_request(payload)
-            
+
             # Извлекаем текстовый ответ от модели
             llm_text = response_data["choices"][0]["message"]["content"]
 
             # Очищаем ответ от блоков кода Markdown
             import re
-            json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', llm_text, re.DOTALL)
-            
+
+            json_match = re.search(
+                r"```(?:json)?\s*(\{.*?\})\s*```", llm_text, re.DOTALL
+            )
+
             if json_match:
                 cleaned_json_text = json_match.group(1)
             else:
@@ -135,13 +148,14 @@ class LLMAgent:
             action_plan = json.loads(cleaned_json_text)
             plan = action_plan.get("plan", [])
             return plan
-            
+
         except (json.JSONDecodeError, KeyError, Exception) as e:
             print(f"Произошла ошибка при создании плана: {e}")
             # Пробуем альтернативный подход: извлечь JSON из текста
             try:
                 # Ищем JSON в тексте без маркеров
                 import re
+
                 json_match = re.search(r'\{.*"plan".*\}', llm_text, re.DOTALL)
                 if json_match:
                     action_plan = json.loads(json_match.group())
@@ -165,17 +179,17 @@ class LLMAgent:
         Original User Question: {user_query}
 
         Conversation Log:
-        {chr(10).join([msg['content'] for msg in self.conversation_history])}
+        {chr(10).join([msg["content"] for msg in self.conversation_history])}
         """
-        
+
         payload = {
             "model": self.model,
-            "messages": [{"role": "user", "content": prompt}]
+            "messages": [{"role": "user", "content": prompt}],
         }
-        
+
         if self.local:
             payload["stream"] = False
-        
+
         try:
             response_data = self._make_api_request(payload)
             final_text = response_data["choices"][0]["message"]["content"]
@@ -187,18 +201,22 @@ class LLMAgent:
         """
         Основной метод для обработки запроса пользователя.
         """
-        print(f"Агент анализирует ваш запрос... (Режим: {'локальный Ollama' if self.local else 'OpenRouter'})")
-        
-        # --- Шаг 1: Планирование ---
+        print(
+            f"Агент анализирует ваш запрос... (Режим: {'локальный Ollama' if self.local else 'OpenRouter'})"
+        )
+
+        # Шаг 1: Планирование
         plan = self._ask_llm_for_plan(query)
 
         if not plan:
             print("Инструменты не требуются. Генерирую ответ напрямую.")
             # Генерируем прямой ответ через LLM
-            direct_prompt = f"Ответьте на следующий вопрос кратко и информативно: {query}"
+            direct_prompt = (
+                f"Ответьте на следующий вопрос кратко и информативно: {query}"
+            )
             payload = {
                 "model": self.model,
-                "messages": [{"role": "user", "content": direct_prompt}]
+                "messages": [{"role": "user", "content": direct_prompt}],
             }
             if self.local:
                 payload["stream"] = False
@@ -208,45 +226,48 @@ class LLMAgent:
             except:
                 return "Извините, не удалось сгенерировать ответ."
 
-        # --- Шаг 2: Исполнение плана ---
+        # Шаг 2: Исполнение плана
         print(f"Запрос: {plan}")
         for step in plan:
-            tool_name = step.get('action')
-            tool_input = step.get('input')
+            tool_name = step.get("action")
+            tool_input = step.get("input")
 
             if tool_name in self.tools:
                 print(f"Выполняется инструмент: '{tool_name}'")
                 result = self.tools[tool_name].use(tool_input)
                 print(f"Результат: {result}...")
-                
+
                 # Добавляем результат в историю
-                self.conversation_history.append({
-                    'role': 'system',
-                    'content': f"Tool {tool_name} result: {result}"
-                })
+                self.conversation_history.append(
+                    {"role": "system", "content": f"Tool {tool_name} result: {result}"}
+                )
             else:
                 error_msg = f"Ошибка: инструмент с именем '{tool_name}' не найден."
                 print(error_msg)
-                self.conversation_history.append({'role': 'system', 'content': error_msg})
-        
-        # --- Шаг 3: Генерация финального ответа ---
+                self.conversation_history.append(
+                    {"role": "system", "content": error_msg}
+                )
+
+        # Шаг 3: Генерация финального ответа
+        if all(step.get("action") == "image_generator" for step in plan):
+            return result
         final_response = self._generate_final_response(query)
         return final_response
 
     def test_ollama_connection(self) -> bool:
         """
         Тестирует соединение с локальным Ollama сервером.
-        
+
         Returns:
             bool: True если соединение успешно, иначе False.
         """
         if not self.local:
             return False
-        
+
         try:
             # Проверяем доступность Ollama API
             test_url = f"{self.ollama_base_url}/v1/models"
-            response = requests.get(test_url)
+            response = requests.get(test_url, timeout=5)
             return response.status_code == 200
         except:
             return False

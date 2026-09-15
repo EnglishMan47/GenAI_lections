@@ -1,51 +1,51 @@
 # llm_agent/tool_image_generator.py
 
 import base64
+import math
+from uuid import uuid4
 import re
 import time
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit
 
 import requests
 from decouple import config
 
-# Сервисы отдают готовую картинку байтами и не хранят её у себя, поэтому файл
-# сначала сохраняется на диск, а публичная ссылка получается загрузкой на хостинг.
+# Сервисы отдают готовую картинку байтами и не хранят её у себя, поэтому файл сначала сохраняется на диск, а публичная ссылка получается загрузкой на хостинг
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent.parent / "generated_images"
 
-# Запасной провайдер: Replicate. Требует положительный баланс на счету.
+# Запасной вариант Replicate
 REPLICATE_API_URL = "https://api.replicate.com/v1/models/{model}/predictions"
 REPLICATE_DEFAULT_MODEL = "black-forest-labs/flux-schnell"
 
-# Основной провайдер: Hugging Face с моделью Stability AI. Бесплатный токен,
-# точный размер в пикселях (платные сервисы принимают только пропорции).
+# Hugging Face с моделью Stability AI
 HUGGINGFACE_API_URL = "https://router.huggingface.co/{route}/v1/images/generations"
 HUGGINGFACE_DEFAULT_ROUTE = "hf-inference"
 HUGGINGFACE_DEFAULT_MODEL = "stabilityai/stable-diffusion-3-medium-diffusers"
-
-# У Hugging Face два разных API. Собственный исполнитель hf-inference работает по
-# старой схеме: модель в адресе, ответ - сразу байты картинки. Сторонние
-# исполнители (nscale, fal-ai) отвечают по OpenAI-совместимой схеме с base64.
 HUGGINGFACE_LEGACY_ROUTE = "hf-inference"
 HUGGINGFACE_LEGACY_URL = "https://router.huggingface.co/hf-inference/models/{model}"
 
-# Replicate не принимает произвольные width/height - только соотношение сторон
-# из своего списка, поэтому размер приходится приводить к ближайшему значению.
-REPLICATE_ASPECT_RATIOS = ("1:1", "16:9", "21:9", "3:2", "2:3", "4:5",
-                           "5:4", "3:4", "4:3", "9:16", "9:21")
+# Replicate принимает соотношение сторон
+REPLICATE_ASPECT_RATIOS = (
+    "1:1",
+    "16:9",
+    "21:9",
+    "3:2",
+    "2:3",
+    "4:5",
+    "5:4",
+    "3:4",
+    "4:3",
+    "9:16",
+    "9:21",
+)
 
-# Запасной провайдер: работает без ключа, нужен чтобы код запускался у любого,
-# кто склонировал репозиторий и не заводил платные аккаунты.
+# Запасной провайдер: работает без ключа, нужен чтобы код запускался у любого
 POLLINATIONS_BASE_URL = "https://image.pollinations.ai/prompt"
 
-# Чтобы выполнить требование "возвращать URL", сохранённый файл выкладывается на
-# бесплатный хостинг. Внимание: загруженная картинка становится доступна любому в
-# интернете; отключается параметром upload_to_host=False.
-#
-# Хостинги пробуются по очереди: любой из них может отказать, полагаться на один
-# нельзя. Тонкость: litterbox отвечает "412 Precondition Failed" на стандартный
-# User-Agent библиотеки requests, поэтому его приходится подменять.
+# Сохранённый файл выкладывается на бесплатный хостинг
+# Хостинги пробуются по очереди
 UPLOAD_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ImageGeneratorTool/1.0"
 
 IMAGE_HOSTS = (
@@ -72,7 +72,7 @@ IMAGE_HOSTS = (
     },
 )
 
-# Из какой переменной окружения брать ключ для каждого провайдера с авторизацией.
+# Из какой переменной окружения брать ключ
 PROVIDER_ENV_VARS = {
     "replicate": "REPLICATE_API_TOKEN",
     "huggingface": "HUGGINGFACE_API_TOKEN",
@@ -80,34 +80,29 @@ PROVIDER_ENV_VARS = {
 
 SUPPORTED_PROVIDERS = ("huggingface", "replicate", "pollinations")
 
-# Порядок, в котором пробуются запасные провайдеры, если основной недоступен:
-# сначала бесплатный по токену, затем совсем без ключа.
+# Порядок, в котором пробуются запасные провайдеры, если основной недоступен
+# Сначала бесплатный по токену, затем совсем без ключа
 FALLBACK_ORDER = ("huggingface", "pollinations")
 
-# Ограничения на размер картинки и длину описания.
+# Ограничения на размер картинки и длину описания
 DEFAULT_WIDTH = 1024
 DEFAULT_HEIGHT = 1024
 
-# Что модель рисовать не должна. Диффузионные модели плохо справляются с кистями
-# рук - лишние и сросшиеся пальцы встречаются постоянно, - и явный запрет заметно
-# улучшает результат. Работает только на маршруте hf-inference: OpenAI-совместимая
-# схема сторонних исполнителей параметр negative_prompt не предусматривает.
+# Негативный промпт для диффузионных моделей
 DEFAULT_NEGATIVE_PROMPT = (
     "deformed hands, extra fingers, missing fingers, fused fingers, "
     "mutated hands, bad anatomy, extra limbs, malformed, blurry"
 )
 
-# Больше шагов - аккуратнее мелкие детали, в первую очередь пальцы.
 DEFAULT_STEPS = 40
 MIN_SIZE = 64
 MAX_SIZE = 2048
 MAX_PROMPT_LENGTH = 1000
 
-# Пользователь может дописать размер в конце запроса: "рыжий кот в шляпе | 512x512".
-# Допускаем и латинскую 'x', и кириллическую 'х', и звёздочку - модель пишет по-разному.
+# Пользователь может дописать размер в конце запроса
+# Допускается латинская 'x', кириллическая'х', и '*'
 SIZE_PATTERN = re.compile(r"\s*\|\s*(\d+)\s*[xх*]\s*(\d+)\s*$", re.IGNORECASE)
 
-# Для имени файла оставляем только безопасные символы.
 SLUG_PATTERN = re.compile(r"[^a-zA-Z0-9а-яА-ЯёЁ]+")
 
 
@@ -118,20 +113,28 @@ class ImageGeneratorTool:
     description = (
         "Генерирует изображение по текстовому описанию и возвращает ссылку (URL) на него. "
         "Используй, когда просят нарисовать, сгенерировать или создать картинку. "
-        "Описание передавай на английском языке: модели генерации не понимают русский. "
+        "Описание передавай на английском языке. "
         "Размер можно указать в конце через вертикальную черту, например: "
         "'watercolor painting of a ginger cat wearing a hat | 512x512'."
     )
 
-    def __init__(self, provider: str = "huggingface", api_key: str = None,
-                 model: str = REPLICATE_DEFAULT_MODEL,
-                 hf_route: str = HUGGINGFACE_DEFAULT_ROUTE,
-                 hf_model: str = HUGGINGFACE_DEFAULT_MODEL, width: int = DEFAULT_WIDTH,
-                 height: int = DEFAULT_HEIGHT, timeout: int = 60, seed: int = None,
-                 negative_prompt: str = DEFAULT_NEGATIVE_PROMPT,
-                 steps: int = DEFAULT_STEPS,
-                 output_dir=DEFAULT_OUTPUT_DIR, fallback: bool = True,
-                 upload_to_host: bool = True):
+    def __init__(
+        self,
+        provider: str = "huggingface",
+        api_key: str = None,
+        model: str = REPLICATE_DEFAULT_MODEL,
+        hf_route: str = HUGGINGFACE_DEFAULT_ROUTE,
+        hf_model: str = HUGGINGFACE_DEFAULT_MODEL,
+        width: int = DEFAULT_WIDTH,
+        height: int = DEFAULT_HEIGHT,
+        timeout: int = 60,
+        seed: int = None,
+        negative_prompt: str = DEFAULT_NEGATIVE_PROMPT,
+        steps: int = DEFAULT_STEPS,
+        output_dir=DEFAULT_OUTPUT_DIR,
+        fallback: bool = True,
+        upload_to_host: bool = True,
+    ):
         """
         Инициализирует инструмент генерации изображений.
 
@@ -139,7 +142,7 @@ class ImageGeneratorTool:
             provider (str): "huggingface" (по умолчанию), "replicate"
                             или "pollinations" (работает без ключа).
             api_key (str, optional): Ключ провайдера. Если не передан, берётся из
-                                     переменной окружения (см. PROVIDER_ENV_VARS).
+                                     переменной окружения.
             model (str): Имя модели для Replicate.
             hf_route (str): Исполнитель, к которому роутер Hugging Face шлёт запрос.
             hf_model (str): Имя модели для Hugging Face.
@@ -147,15 +150,14 @@ class ImageGeneratorTool:
             height (int): Высота изображения по умолчанию.
             timeout (int): Таймаут HTTP-запросов в секундах.
             seed (int, optional): Зерно генерации, чтобы результат был воспроизводимым.
-            negative_prompt (str): Перечень того, чего на картинке быть не должно.
+            negative_prompt (str): Негативный промпт для картинки.
             steps (int): Число шагов генерации: больше - аккуратнее детали, но дольше.
             output_dir: Папка, куда сохраняются сгенерированные картинки.
             fallback (bool): Пробовать ли запасных провайдеров, если основной
                              ответил ошибкой (нет средств, неверный ключ, лимит).
             upload_to_host (bool): Выкладывать ли сохранённую картинку на
                              бесплатный хостинг, чтобы вернуть публичную
-                             http-ссылку вместо локальной file://. Картинка при
-                             этом становится доступна всем в интернете.
+                             http-ссылку вместо локальной file://.
 
         Raises:
             ValueError: Если указан неизвестный провайдер или некорректный размер.
@@ -164,18 +166,32 @@ class ImageGeneratorTool:
             raise ValueError(
                 f"Неизвестный провайдер '{provider}'. Доступны: {', '.join(SUPPORTED_PROVIDERS)}"
             )
-        if not isinstance(timeout, (int, float)) or timeout <= 0:
-            raise ValueError(f"Таймаут должен быть положительным числом, получено: {timeout!r}")
-        if seed is not None and (not isinstance(seed, int) or seed < 0):
-            raise ValueError(f"Зерно генерации должно быть целым неотрицательным числом: {seed!r}")
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
+            raise ValueError(
+                f"Таймаут должен быть положительным числом, получено: {timeout!r}"
+            )
+        if seed is not None and (type(seed) is not int or not 0 <= seed <= 4294967295):
+            raise ValueError(
+                f"Зерно генерации должно быть целым неотрицательным числом: {seed!r}"
+            )
 
-        # Ключи всех провайдеров читаем сразу: они нужны, чтобы решить, кого
-        # вообще есть смысл пробовать в качестве запасного.
-        self.api_keys = {name: config(env_var, default=None)
-                         for name, env_var in PROVIDER_ENV_VARS.items()}
+        # Ключи всех провайдеров читаем сразу
+        self.api_keys = {
+            name: config(env_var, default=None)
+            for name, env_var in PROVIDER_ENV_VARS.items()
+        }
 
         if api_key:
             self.api_keys[provider] = api_key
+        if type(steps) is not int or not 1 <= steps <= 100:
+            raise ValueError("steps must be an integer between 1 and 100")
+        if not isinstance(negative_prompt, str):
+            raise ValueError("negative_prompt must be a string")
         self.provider = provider
         self.model = model
         self.hf_route = hf_route
@@ -208,13 +224,13 @@ class ImageGeneratorTool:
             for position, provider in enumerate(chain):
                 try:
                     url = self._generate(provider, text, width, height)
-                except requests.exceptions.HTTPError as e:
-                    # Кончились кредиты, протух ключ, превышен лимит - сам запрос
-                    # при этом корректный, поэтому пробуем следующего провайдера.
+                except requests.exceptions.RequestException as e:
                     if position == len(chain) - 1:
                         raise
-                    print(f"> {provider} вернул ошибку ({e.response.status_code}), "
-                          f"пробую следующего провайдера: {chain[position + 1]}.")
+                    print(
+                        f"> {provider} вернул ошибку ({getattr(e.response, 'status_code', type(e).__name__)}), "
+                        f"пробую следующего провайдера: {chain[position + 1]}."
+                    )
                     continue
 
                 print(f"> Изображение готово: {url}")
@@ -230,7 +246,6 @@ class ImageGeneratorTool:
         except requests.exceptions.RequestException as e:
             return f"Ошибка при обращении к сервису генерации изображений: {e}"
         except OSError as e:
-            # Нет прав на папку, кончилось место на диске и т.п.
             return f"Ошибка: не удалось сохранить изображение на диск ({e})."
 
     def _provider_chain(self) -> list:
@@ -248,8 +263,11 @@ class ImageGeneratorTool:
         if self.fallback:
             candidates += [name for name in FALLBACK_ORDER if name != self.provider]
 
-        chain = [name for name in candidates
-                 if name not in PROVIDER_ENV_VARS or self.api_keys.get(name)]
+        chain = [
+            name
+            for name in candidates
+            if name not in PROVIDER_ENV_VARS or self.api_keys.get(name)
+        ]
 
         if not chain:
             raise ValueError(
@@ -287,8 +305,10 @@ class ImageGeneratorTool:
         match = SIZE_PATTERN.search(prompt)
 
         if match:
-            width, height = self._validate_size(int(match.group(1)), int(match.group(2)))
-            prompt = prompt[:match.start()]
+            width, height = self._validate_size(
+                int(match.group(1)), int(match.group(2))
+            )
+            prompt = prompt[: match.start()]
 
         return self._validate_prompt(prompt), width, height
 
@@ -318,6 +338,9 @@ class ImageGeneratorTool:
         Raises:
             ValueError: Если размер не является числом или выходит за границы.
         """
+        for value in (width, height):
+            if isinstance(value, bool) or not isinstance(value, (int, str)):
+                raise ValueError("Image dimensions must be integers")
         try:
             width, height = int(width), int(height)
         except (TypeError, ValueError):
@@ -336,8 +359,7 @@ class ImageGeneratorTool:
         """
         Переводит размер в пикселях в ближайшее допустимое соотношение сторон.
 
-        Провайдеры принимают только значения из своего списка, поэтому выбираем
-        то, чья пропорция ближе всего к запрошенной.
+        Провайдеры принимают только значения из своего списка, поэтому выбираем то, чья пропорция ближе всего к запрошенной.
         """
         target = width / height
 
@@ -350,9 +372,6 @@ class ImageGeneratorTool:
     def _ensure_image_response(self, response, service: str) -> None:
         """
         Проверяет, что сервис прислал именно картинку, а не HTML-страницу с ошибкой.
-
-        Код 200 сам по себе этого не гарантирует: некоторые сервисы отдают
-        страницу "попробуйте позже" с успешным статусом.
 
         Raises:
             ValueError: Если тип содержимого не image/*.
@@ -378,7 +397,10 @@ class ImageGeneratorTool:
 
         slug = SLUG_PATTERN.sub("_", text).strip("_")[:40] or "image"
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = self.output_dir / f"{slug}_{timestamp}.{extension}"
+        path = (
+            self.output_dir.resolve()
+            / f"{slug}_{timestamp}_{uuid4().hex[:8]}.{extension}"
+        )
         path.write_bytes(content)
 
         if self.upload_to_host:
@@ -390,9 +412,7 @@ class ImageGeneratorTool:
         """
         Выкладывает картинку на бесплатный хостинг и возвращает публичную ссылку.
 
-        Хостинги пробуются по очереди, пока какой-нибудь не примет файл. Если не
-        принял никто, возвращаем локальную ссылку: терять уже сгенерированную
-        картинку из-за недоступности стороннего сервиса не стоит.
+        Хостинги пробуются по очереди, пока какой-нибудь не примет файл. Если не принял никто, возвращаем локальную ссылку.
         """
         for host in IMAGE_HOSTS:
             try:
@@ -406,8 +426,14 @@ class ImageGeneratorTool:
                 response.raise_for_status()
                 return self._parse_host_response(host, response)
 
-            except (requests.exceptions.RequestException, ValueError, KeyError):
-                # Хостинг мог отказать по своим причинам - молча пробуем следующий.
+            except (
+                requests.exceptions.RequestException,
+                ValueError,
+                KeyError,
+                TypeError,
+                IndexError,
+                AttributeError,
+            ):
                 continue
 
         print("> Ни один хостинг не доступен, возвращаю локальную ссылку.")
@@ -427,10 +453,14 @@ class ImageGeneratorTool:
             url = files[0].get("url", "") if files else ""
         else:
             url = ((response.json() or {}).get("data") or {}).get("url", "")
-            # tmpfiles отдаёт ссылку на страницу просмотра, прямая - через /dl/.
+            # tmpfiles отдаёт ссылку на страницу просмотра
             url = url.replace("tmpfiles.org/", "tmpfiles.org/dl/", 1)
 
-        if not url.startswith("http"):
+        if (
+            not isinstance(url, str)
+            or urlsplit(url).scheme not in ("http", "https")
+            or not urlsplit(url).hostname
+        ):
             raise ValueError(f"неожиданный ответ: {str(url or response.text)[:80]}")
 
         return url
@@ -439,8 +469,7 @@ class ImageGeneratorTool:
         """
         Генерирует изображение через роутер Hugging Face и возвращает ссылку на файл.
 
-        Единственный из провайдеров, который принимает точный размер, а не
-        соотношение сторон. Картинка приходит в base64 внутри JSON.
+        Единственный из провайдеров, который принимает точный размер, а не соотношение сторон. Картинка приходит в base64 внутри JSON.
         """
         headers = {
             "Authorization": f"Bearer {self.api_keys['huggingface']}",
@@ -462,16 +491,19 @@ class ImageGeneratorTool:
 
         response = requests.post(
             HUGGINGFACE_API_URL.format(route=self.hf_route),
-            json=payload, headers=headers, timeout=self.timeout,
+            json=payload,
+            headers=headers,
+            timeout=self.timeout,
         )
         response.raise_for_status()
 
         return self._save_image(self._decode_huggingface(response.json()), text, "png")
 
-    def _generate_via_huggingface_legacy(self, headers: dict, text: str,
-                                        width: int, height: int) -> str:
+    def _generate_via_huggingface_legacy(
+        self, headers: dict, text: str, width: int, height: int
+    ) -> str:
         """
-        Обращается к собственному исполнителю Hugging Face (hf-inference).
+        Обращается к собственному исполнителю Hugging Face
 
         Здесь модель указывается в адресе, размер уходит в parameters, а ответ
         приходит готовыми байтами картинки, без JSON и base64.
@@ -490,7 +522,9 @@ class ImageGeneratorTool:
 
         response = requests.post(
             HUGGINGFACE_LEGACY_URL.format(model=self.hf_model),
-            json=payload, headers=headers, timeout=self.timeout,
+            json=payload,
+            headers=headers,
+            timeout=self.timeout,
         )
         response.raise_for_status()
         self._ensure_image_response(response, "Hugging Face")
@@ -506,7 +540,12 @@ class ImageGeneratorTool:
         """
         items = payload.get("data") if isinstance(payload, dict) else None
 
-        if not items or not isinstance(items[0], dict) or not items[0].get("b64_json"):
+        if (
+            not isinstance(items, list)
+            or not items
+            or not isinstance(items[0], dict)
+            or not items[0].get("b64_json")
+        ):
             raise ValueError("Hugging Face вернул ответ без изображения.")
 
         try:
@@ -518,9 +557,7 @@ class ImageGeneratorTool:
         """
         Генерирует изображение через Replicate API и возвращает URL результата.
 
-        Заголовок 'Prefer: wait' просит сервер дождаться готовности картинки,
-        но при долгой генерации ответ всё равно может вернуться незавершённым -
-        тогда дожидаемся результата опросом.
+        Заголовок 'Prefer: wait' просит сервер дождаться готовности картинки, но при долгой генерации ответ всё равно может вернуться незавершённым, тогда дожидаемся результата опросом.
         """
         headers = {
             "Authorization": f"Bearer {self.api_keys['replicate']}",
@@ -530,7 +567,9 @@ class ImageGeneratorTool:
         payload = {
             "input": {
                 "prompt": text,
-                "aspect_ratio": self._to_aspect_ratio(width, height, REPLICATE_ASPECT_RATIOS),
+                "aspect_ratio": self._to_aspect_ratio(
+                    width, height, REPLICATE_ASPECT_RATIOS
+                ),
                 "num_outputs": 1,
                 "output_format": "jpg",
             }
@@ -541,10 +580,14 @@ class ImageGeneratorTool:
 
         response = requests.post(
             REPLICATE_API_URL.format(model=self.model),
-            json=payload, headers=headers, timeout=self.timeout,
+            json=payload,
+            headers=headers,
+            timeout=self.timeout,
         )
         response.raise_for_status()
         prediction = response.json()
+        if not isinstance(prediction, dict):
+            raise ValueError("Replicate returned an invalid response")
 
         if prediction.get("status") not in ("succeeded", "failed", "canceled"):
             prediction = self._poll_replicate(prediction, headers)
@@ -555,16 +598,29 @@ class ImageGeneratorTool:
         """Периодически опрашивает Replicate, пока генерация не завершится."""
         poll_url = (prediction.get("urls") or {}).get("get")
 
-        if not poll_url:
-            raise ValueError("Replicate не вернул ссылку для проверки статуса генерации.")
+        if (
+            not isinstance(poll_url, str)
+            or urlsplit(poll_url).scheme != "https"
+            or urlsplit(poll_url).hostname != "api.replicate.com"
+        ):
+            raise ValueError(
+                "Replicate не вернул ссылку для проверки статуса генерации."
+            )
 
-        deadline = time.time() + self.timeout
+        deadline = time.monotonic() + self.timeout
 
-        while time.time() < deadline:
-            time.sleep(2)
-            response = requests.get(poll_url, headers=headers, timeout=self.timeout)
+        while time.monotonic() < deadline:
+            time.sleep(min(2, max(0, deadline - time.monotonic())))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            response = requests.get(
+                poll_url, headers=headers, timeout=remaining, allow_redirects=False
+            )
             response.raise_for_status()
             prediction = response.json()
+            if not isinstance(prediction, dict):
+                raise ValueError("Replicate returned an invalid response")
 
             if prediction.get("status") in ("succeeded", "failed", "canceled"):
                 return prediction
@@ -585,14 +641,19 @@ class ImageGeneratorTool:
         if not output:
             raise ValueError("Replicate вернул пустой результат генерации.")
 
+        if (
+            not isinstance(output, str)
+            or urlsplit(output).scheme not in ("http", "https")
+            or not urlsplit(output).hostname
+        ):
+            raise ValueError("Replicate returned an invalid image URL")
         return output
 
     def _build_url(self, text: str, width: int, height: int) -> str:
         """
         Собирает URL картинки для сервиса Pollinations.
 
-        Описание уходит в путь запроса, поэтому его нужно закодировать:
-        иначе пробелы и кириллица сломают ссылку.
+        Описание уходит в путь запроса.
         """
         params = {"width": width, "height": height, "nologo": "true"}
 
@@ -605,9 +666,7 @@ class ImageGeneratorTool:
         """
         Убеждается, что по ссылке действительно отдаётся изображение.
 
-        Сервис генерирует картинку в момент первого обращения, поэтому запрос
-        одновременно и запускает генерацию, и проверяет её результат. Тело ответа
-        не выкачиваем - нам нужен только URL.
+        Сервис генерирует картинку в момент первого обращения, поэтому запрос одновременно и запускает генерацию, и проверяет её результат.
         """
         response = requests.get(url, timeout=self.timeout, stream=True)
         response.close()
@@ -615,8 +674,9 @@ class ImageGeneratorTool:
         self._ensure_image_response(response, "Pollinations")
         return True
 
-    def _format_result(self, text: str, url: str, width: int, height: int,
-                       provider: str) -> str:
+    def _format_result(
+        self, text: str, url: str, width: int, height: int, provider: str
+    ) -> str:
         """Готовит итоговый ответ для агента."""
         return (
             f"Изображение по запросу '{text}' сгенерировано "
